@@ -121,7 +121,7 @@ def fetch_events(limit: int, days: int) -> List[Event]:
 
 @app.command()
 def main(
-    limit: int = typer.Option(500, help="Number of events to request from API"),
+    limit: int = typer.Option(512, help="Number of events to request from API"),
     days: int = typer.Option(91, help="Maximum days until event end date"),
     min_event_prob: float = typer.Option(0.8, help="Minimum score threshold"),
     top: int = typer.Option(16, help="Number of rows to output"),
@@ -148,7 +148,7 @@ def main(
         writer.writerow([
             int(event.volume),
             event.title,
-            event.endDate,
+            event.endDate.split("T")[0],
             int(score * 100),
             f"https://polymarket.com/event/{event.slug}"
         ])
