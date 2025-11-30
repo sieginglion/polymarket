@@ -3,19 +3,26 @@
 Polymarket Market Lister
 
 This script fetches markets from the Polymarket API, groups them by event,
-and displays them in a formatted table in the terminal.
+and exports them to CSV via standard output.
 """
 
-import argparse
+import csv
 import sys
-from dataclasses import dataclass
+import logging
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Any, Optional
+from typing import List, Optional, Dict, Any
 
-import requests
-from rich.console import Console
-from rich.table import Table
-from rich import box
+import httpx
+import typer
+from pydantic import BaseModel, Field
+
+# Configure logging to stderr
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    stream=sys.stderr
+)
+logger = logging.getLogger(__name__)
 
 # Constants
 API_URL = "https://gamma-api.polymarket.com/markets"
@@ -24,32 +31,42 @@ DEFAULT_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/120.0.0.0 Safari/537.36"
 )
+DEFAULT_LIMIT = 500
+DEFAULT_DAYS_FILTER = 91
+DEFAULT_TOP_EVENTS = 16
 
-@dataclass
-class Event:
+app = typer.Typer(help="List top Polymarket events by volume.")
+
+# --- Data Models ---
+
+class Market(BaseModel):
+    """Represents a single market from the API."""
+    id: str
+    question: str
+    slug: Optional[str] = None
+    volumeNum: float = 0.0
+    endDateIso: Optional[str] = None
+    events: List[Dict[str, Any]] = Field(default_factory=list)
+
+class Event(BaseModel):
     """Represents a grouped Polymarket event."""
     title: str
     volume: float
-    end_date: str
+    end_date: Optional[str]
     url: str
     slug: str
 
-class PolymarketClient:
+# --- Service ---
+
+class MarketClient:
     """Client for interacting with the Polymarket API."""
 
     def __init__(self, user_agent: str = DEFAULT_USER_AGENT):
         self.headers = {"User-Agent": user_agent}
-        self.console = Console()
 
-    def fetch_markets(self, limit: int = 500) -> List[Dict[str, Any]]:
+    def fetch_markets(self, limit: int = DEFAULT_LIMIT) -> List[Market]:
         """
         Fetches markets from the Polymarket API.
-
-        Args:
-            limit: The maximum number of markets to fetch.
-
-        Returns:
-            A list of market dictionaries.
         """
         params = {
             "limit": limit,
@@ -58,28 +75,37 @@ class PolymarketClient:
             "closed": "false"
         }
 
+        logger.info(f"Fetching top {limit} markets from Polymarket...")
         try:
-            with self.console.status(f"[bold green]Fetching {limit} markets..."):
-                response = requests.get(API_URL, params=params, headers=self.headers)
+            with httpx.Client() as client:
+                response = client.get(API_URL, params=params, headers=self.headers)
                 response.raise_for_status()
-                return response.json()
-        except requests.exceptions.RequestException as e:
-            self.console.print(f"[bold red]Error fetching markets:[/bold red] {e}")
+                data = response.json()
+                
+                markets = []
+                for item in data:
+                    try:
+                        markets.append(Market(**item))
+                    except Exception:
+                        continue
+                logger.info(f"Successfully fetched {len(markets)} markets.")
+                return markets
+        except httpx.RequestError as e:
+            logger.error(f"Network error fetching markets: {e}")
             return []
-        except ValueError: # json decode error
-            self.console.print("[bold red]Error decoding JSON response[/bold red]")
+        except ValueError:
+            logger.error("Error decoding JSON response")
+            return []
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}")
             return []
 
-    def process_events(self, markets: List[Dict[str, Any]], days_filter: int) -> List[Event]:
+class MarketProcessor:
+    """Business logic for processing market data."""
+
+    def process_events(self, markets: List[Market], days_filter: int) -> List[Event]:
         """
         Processes raw market data to group by event and filter by date.
-
-        Args:
-            markets: List of raw market dictionaries.
-            days_filter: Number of days from now to filter events by.
-
-        Returns:
-            A list of Event objects sorted by volume.
         """
         now = datetime.now(timezone.utc)
         filter_date_limit = now + timedelta(days=days_filter)
@@ -87,114 +113,95 @@ class PolymarketClient:
         unique_events: Dict[str, Event] = {}
         
         for market in markets:
-            # Check end date
-            end_date_iso = market.get('endDateIso')
-            if not end_date_iso:
+            if not market.endDateIso:
                 continue
                 
             try:
-                # Parse YYYY-MM-DD
-                end_date = datetime.strptime(end_date_iso, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                end_date = datetime.strptime(market.endDateIso, "%Y-%m-%d").replace(tzinfo=timezone.utc)
                 if end_date > filter_date_limit:
                     continue
             except ValueError:
                 continue
 
-            # Get event data
-            events_data = market.get('events', [])
-            
-            # Determine event details
             event_slug = None
             event_title = None
             event_volume = 0.0
             
-            if events_data and isinstance(events_data, list) and len(events_data) > 0:
-                event = events_data[0]
-                event_slug = event.get('slug')
-                event_title = event.get('title')
-                # Sometimes volume is in the event, sometimes we aggregate from markets
-                # For simplicity, we'll take the event volume if available, or market volume
+            if market.events:
+                event_data = market.events[0]
+                event_slug = event_data.get('slug')
+                event_title = event_data.get('title')
                 try:
-                    event_volume = float(event.get('volume', 0))
+                    event_volume = float(event_data.get('volume', 0))
                 except (ValueError, TypeError):
                     event_volume = 0.0
             
-            # Fallback or primary logic
             if event_slug:
                 if event_slug not in unique_events:
                      unique_events[event_slug] = Event(
                         title=event_title or "Unknown Event",
                         volume=event_volume,
-                        end_date=end_date_iso,
+                        end_date=market.endDateIso,
                         url=f"https://polymarket.com/event/{event_slug}",
                         slug=event_slug
                     )
             else:
-                 # Fallback for markets without event grouping
-                slug = market.get('slug')
+                slug = market.slug
                 if slug and slug not in unique_events:
-                    try:
-                        vol = float(market.get('volumeNum', 0))
-                    except (ValueError, TypeError):
-                        vol = 0.0
-                        
                     unique_events[slug] = Event(
-                        title=market.get('question', "Unknown Market"),
-                        volume=vol,
-                        end_date=end_date_iso,
+                        title=market.question,
+                        volume=market.volumeNum,
+                        end_date=market.endDateIso,
                         url=f"https://polymarket.com/market/{slug}",
                         slug=slug
                     )
         
-        # Sort by volume descending
-        return sorted(unique_events.values(), key=lambda x: x.volume, reverse=True)
+        sorted_events = sorted(unique_events.values(), key=lambda x: x.volume, reverse=True)
+        logger.info(f"Processed {len(sorted_events)} unique events after filtering.")
+        return sorted_events
 
-    def display_events(self, events: List[Event], top_n: int = 10):
-        """
-        Prints the top N events in a formatted table using rich.
+class MarketCLI:
+    """Handles CLI presentation and output."""
 
-        Args:
-            events: List of processed Event objects.
-            top_n: Number of events to display.
-        """
-        table = Table(title=f"Top {top_n} Polymarket Events (Volume)", box=box.ROUNDED)
+    @staticmethod
+    def write_csv(events: List[Event], top_n: int):
+        """Writes the top N events to stdout in CSV format."""
+        try:
+            fieldnames = ['Volume', 'End Date', 'Event Name', 'URL']
+            writer = csv.DictWriter(sys.stdout, fieldnames=fieldnames)
 
-        table.add_column("Volume", justify="right", style="cyan", no_wrap=True)
-        table.add_column("End Date", style="magenta")
-        table.add_column("Event Name", style="white")
-        table.add_column("URL", style="blue")
+            writer.writeheader()
+            for event in events[:top_n]:
+                writer.writerow({
+                    'Volume': event.volume,
+                    'End Date': event.end_date,
+                    'Event Name': event.title,
+                    'URL': event.url
+                })
+        except IOError as e:
+            logger.error(f"Error writing to CSV: {e}")
 
-        for event in events[:top_n]:
-            formatted_volume = f"${event.volume:,.2f}"
-            display_name = event.title
-            if len(display_name) > 60:
-                display_name = display_name[:57] + "..."
-            
-            table.add_row(
-                formatted_volume,
-                event.end_date,
-                display_name,
-                event.url
-            )
+# --- CLI ---
 
-        self.console.print(table)
-
-def main():
-    parser = argparse.ArgumentParser(description="List top Polymarket events by volume.")
-    parser.add_argument("--limit", type=int, default=500, help="Number of markets to fetch (default: 500)")
-    parser.add_argument("--days", type=int, default=30, help="Filter events ending within N days (default: 30)")
-    parser.add_argument("--top", type=int, default=16, help="Number of top events to display (default: 16)")
+@app.command()
+def main(
+    limit: int = typer.Option(DEFAULT_LIMIT, help="Number of markets to fetch"),
+    days: int = typer.Option(DEFAULT_DAYS_FILTER, help="Filter events ending within N days"),
+    top: int = typer.Option(DEFAULT_TOP_EVENTS, help="Number of top events to display"),
+):
+    """
+    Fetch and list top Polymarket events by volume.
+    """
+    client = MarketClient()
+    processor = MarketProcessor()
     
-    args = parser.parse_args()
-
-    client = PolymarketClient()
-    markets = client.fetch_markets(limit=args.limit)
+    markets = client.fetch_markets(limit=limit)
     
     if markets:
-        sorted_events = client.process_events(markets, args.days)
-        client.display_events(sorted_events, top_n=args.top)
+        sorted_events = processor.process_events(markets, days)
+        MarketCLI.write_csv(sorted_events, top)
     else:
-        print("No markets found.")
+        logger.warning("No markets found.")
 
 if __name__ == "__main__":
-    main()
+    app()
